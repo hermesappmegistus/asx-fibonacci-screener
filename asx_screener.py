@@ -3,7 +3,8 @@
 ASX Fibonacci Retracement Screener
 
 This script identifies ASX stocks that have recently (within last 3 days)
-hit the 78.6% Fibonacci retracement support level and bounced or held.
+hit the 78.6% Fibonacci retracement support level (based on swing highs/lows)
+and bounced or held.
 
 Usage:
     python asx_screener.py
@@ -20,6 +21,7 @@ from config import (
     ASX_SUFFIX,
     FIB_LEVEL,
     LOOKBACK_DAYS,
+    SWING_LENGTH,
     RECENT_DAYS,
     BOUNCE_THRESHOLD,
     OUTPUT_FILE,
@@ -41,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 class FibonacciScreener:
-    """Screener for identifying Fibonacci retracement bounces"""
+    """Screener for identifying Fibonacci retracement bounces based on swing highs/lows"""
     
     def __init__(self):
         self.results = []
@@ -76,28 +78,108 @@ class FibonacciScreener:
             self.failed_stocks.append(ticker)
             return None
     
-    def calculate_fibonacci_levels(self, data):
+    def identify_swing_highs_lows(self, data, length=SWING_LENGTH):
         """
-        Calculate Fibonacci retracement levels
+        Identify swing highs and lows in the price data
+        
+        A swing high is a candle where the high is higher than the previous 'length' candles
+        and higher than the next 'length' candles.
+        A swing low is a candle where the low is lower than the previous 'length' candles
+        and lower than the next 'length' candles.
+        
+        Args:
+            data: DataFrame with OHLC data
+            length: Number of candles to compare (default 5)
+            
+        Returns:
+            Tuple of (swing_highs, swing_lows) - lists of indices and values
+        """
+        if data is None or len(data) < (length * 2 + 1):
+            return None, None
+        
+        try:
+            swing_highs = []
+            swing_lows = []
+            
+            highs = data['High'].values
+            lows = data['Low'].values
+            
+            # Look for swing highs and lows
+            for i in range(length, len(data) - length):
+                # Check for swing high
+                if highs[i] == max(highs[i-length:i+length+1]):
+                    swing_highs.append((i, highs[i]))
+                
+                # Check for swing low
+                if lows[i] == min(lows[i-length:i+length+1]):
+                    swing_lows.append((i, lows[i]))
+            
+            return swing_highs, swing_lows
+        
+        except Exception as e:
+            logger.error(f"Error identifying swings: {str(e)}")
+            return None, None
+    
+    def get_most_recent_swing_high_low(self, data):
+        """
+        Get the most recent significant swing high and low
         
         Args:
             data: DataFrame with OHLC data
             
         Returns:
-            Dictionary with swing high, low, and 78.6% level
+            Dictionary with most recent swing high and low, or None
         """
-        if data is None or len(data) < 2:
+        swing_highs, swing_lows = self.identify_swing_highs_lows(data, SWING_LENGTH)
+        
+        if not swing_highs or not swing_lows:
             return None
         
         try:
-            # Find swing high and low from lookback period
-            high = data['High'].max()
-            low = data['Low'].min()
+            # Get the most recent swing high and low
+            most_recent_high = swing_highs[-1]
+            most_recent_low = swing_lows[-1]
+            
+            # Ensure we have a high and low to work with
+            swing_high_price = most_recent_high[1]
+            swing_low_price = most_recent_low[1]
+            
+            if swing_high_price <= swing_low_price:
+                # If the most recent high is lower than low, find appropriate pair
+                swing_high_price = max([h[1] for h in swing_highs])
+                swing_low_price = min([l[1] for l in swing_lows])
+            
+            return {
+                'swing_high': swing_high_price,
+                'swing_low': swing_low_price,
+                'range': swing_high_price - swing_low_price
+            }
+        
+        except Exception as e:
+            logger.error(f"Error getting recent swing: {str(e)}")
+            return None
+    
+    def calculate_fibonacci_from_swings(self, swing_info):
+        """
+        Calculate Fibonacci retracement level from swing high/low
+        
+        Args:
+            swing_info: Dictionary with swing_high and swing_low
+            
+        Returns:
+            Dictionary with 78.6% retracement level or None
+        """
+        if swing_info is None:
+            return None
+        
+        try:
+            high = swing_info['swing_high']
+            low = swing_info['swing_low']
             
             if high == low:
                 return None
             
-            # Calculate 78.6% retracement level
+            # Calculate 78.6% retracement level (from high down to low)
             fib_78_6 = high - (high - low) * FIB_LEVEL
             
             return {
@@ -158,7 +240,7 @@ class FibonacciScreener:
     
     def screen_stock(self, ticker):
         """
-        Screen a single stock for Fibonacci bounce
+        Screen a single stock for Fibonacci bounce based on swing highs/lows
         
         Args:
             ticker: Stock ticker (without .AX suffix)
@@ -173,8 +255,14 @@ class FibonacciScreener:
         if data is None:
             return None
         
-        # Calculate Fibonacci levels
-        fib_info = self.calculate_fibonacci_levels(data)
+        # Get most recent swing high and low
+        swing_info = self.get_most_recent_swing_high_low(data)
+        if swing_info is None:
+            logger.debug(f"{ticker}: Could not identify swing highs/lows")
+            return None
+        
+        # Calculate Fibonacci levels from swings
+        fib_info = self.calculate_fibonacci_from_swings(swing_info)
         if fib_info is None:
             return None
         
@@ -196,7 +284,7 @@ class FibonacciScreener:
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         }
         
-        logger.info(f"✓ {ticker} FOUND: Bounced {result['bounce_percentage']:.2f}% from 78.6 level")
+        logger.info(f"✓ {ticker} FOUND: Bounced {result['bounce_percentage']:.2f}% from 78.6 level (swing-based)")
         return result
     
     def screen_multiple(self, tickers):
@@ -239,10 +327,10 @@ class FibonacciScreener:
         df = pd.DataFrame(self.results)
         df = df.sort_values('bounce_percentage', ascending=False)
         
-        print("\n" + "="*100)
-        print(f"ASX FIBONACCI RETRACEMENT SCREENER RESULTS - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Criteria: 78.6% Fib Level, Bounce within last {RECENT_DAYS} days")
-        print("="*100 + "\n")
+        print("\n" + "="*120)
+        print(f"ASX FIBONACCI RETRACEMENT SCREENER RESULTS (SWING-BASED) - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Criteria: 78.6% Fib Level from Swing High/Low, Bounce within last {RECENT_DAYS} days")
+        print("="*120 + "\n")
         
         print(df.to_string(index=False))
         print(f"\nTotal matches: {len(df)}")
@@ -274,7 +362,7 @@ def main():
     Main function with argument parsing
     """
     parser = argparse.ArgumentParser(
-        description='ASX Fibonacci Retracement Screener',
+        description='ASX Fibonacci Retracement Screener (Swing-Based)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   python asx_screener.py                    # Screen default top stocks
@@ -307,7 +395,7 @@ def main():
     else:
         tickers = get_top_asx_stocks()
     
-    logger.info(f"Starting scan of {len(tickers)} stocks...")
+    logger.info(f"Starting scan of {len(tickers)} stocks (swing-based analysis)...")
     screener.screen_multiple(tickers)
     
     # Display and save results
